@@ -9,7 +9,15 @@ import json
 from dotenv import load_dotenv
 import uuid
 import re
+from threading import Thread
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+import asyncio
+from openai import AsyncOpenAI
+
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 
 from flask import Flask, redirect, request, url_for, session, current_app, abort, flash, render_template
 
@@ -21,6 +29,9 @@ from sqlalchemy.orm import (
     mapped_column,
     relationship,
 )
+
+from typing import Optional
+
 from sqlalchemy import ForeignKey, Integer, DateTime, String
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import UUID
@@ -59,6 +70,26 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 db = SQLAlchemy(model_class=Base)
 db.init_app(app)
 
+class Waiting(db.Model):
+    __tablename__ = "waitings"
+
+    id = db.Column(UUID(as_uuid=True), primary_key=True, unique=True, default=uuid.uuid4)
+    email: Mapped[str]
+    model: Mapped[str]
+    parts: Mapped[List["Part"]] = relationship(back_populates="waiting")
+    started_at  = db.Column(DateTime(timezone=True))
+
+class Part(db.Model):
+    __tablename__ = "parts"
+
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    path: Mapped[str]
+    prompt: Mapped[str]
+    delimiter: Mapped[str]
+    code: Mapped[str]
+    waiting_id = mapped_column(ForeignKey("waitings.id"))
+    waiting: Mapped["Waiting"] = relationship(back_populates="parts")
+
 
 class Submission(db.Model):
     __tablename__ = "submissions"
@@ -66,7 +97,7 @@ class Submission(db.Model):
     id = db.Column(UUID(as_uuid=True), primary_key=True, unique=True, default=uuid.uuid4)
     email: Mapped[str]
     comments: Mapped[List["Comment"]] = relationship(back_populates="submission")
-
+    created_at = db.Column(DateTime(timezone=True), server_default=func.now())
 
 class Comment(db.Model):
     __tablename__ = "comments"
@@ -261,30 +292,147 @@ def feedback_undo(id):
       <button hx-post="/feedback/{comment.id}/useless" hx-target="#feedback-{comment.id}">Not Helpful</button>"""
 
 
-@app.route("/submission/<id>", methods=["GET", "POST"])
+
+@app.route("/submission", methods=["POST"])
+def add_submission():
+    data = request.get_json()
+    if validate(data):
+
+        wid = uuid.uuid4()
+        plist = []
+        for p in data["parts"]:
+            if "delimiter" in p:
+                d = p["delimiter"]
+            else:
+                d = None
+            plist.append(
+                Part(
+                    path=p["path"],
+                    prompt=p["prompt"],
+                    code=p["code"],
+                    delimiter=d,
+                    waiting_id = wid
+                )
+            )
+
+        w = Waiting(id = wid,
+                    email=data["email"],
+                    model=data["model"],
+                    parts=plist)
+
+        db.session.add(w)
+        db.session.commit()
+        return {"id": f"{w.id}"}, 200
+    else:
+        abort(401)
+
+async def resolve_part(client, model, part):
+    messages = [{"role": "user", "content": part.prompt}]
+    chat_completion = await client.chat.completions.create(
+            messages=messages,
+            model=model)
+    res = chat_completion.choices[0].message.content
+    if part.delimiter:
+        cut = cut_at_delimiter(res, part.delimiter)
+    else:
+        cut = res
+    return {"text": redact_codeblocks(cut),
+            "code": part.code,
+            "path": part.path}
+
+async def resolve_all(client, model, parts):
+    return await asyncio.gather(*[resolve_part(client, model, p) for p in parts], return_exceptions=True)
+
+def cut_at_delimiter(text, delimiter):
+    sides = text.split(delimiter)
+    if len(sides) < 2: return "FeedBot got confused. We're sorry!"
+    return sides[-1]
+
+def redact_codeblocks(text):
+    # Regular expression pattern to match markdown code blocks
+    codeblock_pattern = r'```(?:.*)\n([\s\S]*?)```'
+    redacted_text = re.sub(codeblock_pattern, "[CODE REDACTED]", text)
+    return redacted_text
+
+
+def resolve_waiting(id, app_context):
+    app_context.push()
+
+    print(f"RESOLVING {id}")
+
+    w = db.session.get(Waiting, id)
+    w.started_at = datetime.now(timezone.utc)
+
+    db.session.commit()
+
+    print("Marked started")
+
+
+    key = os.environ["OPENAI_KEY"]
+
+    client = AsyncOpenAI(api_key=key)
+
+    comments = asyncio.run(resolve_all(client, w.model, w.parts))
+
+    print(comments)
+
+    comment_list = []
+    for com in comments:
+        comment_list.append(
+            Comment(
+                text=com["text"],
+                code=com["code"],
+                path=com["path"],
+                submission_id=id,
+            )
+        )
+
+    sub = Submission(id=id,
+                     email=w.email,
+                     comments=comment_list)
+    db.session.add(sub)
+    db.session.commit()
+
+
+@app.route("/submission/<id>", methods=["GET"])
 def submission(id):
     if "email" not in session:
         session["redirect_to"] = request.full_path
         return oauth2_login()
 
-    submission = db.get_or_404(Submission, id)
-    if (submission.email != session["email"]) and (session["email"] not in staff):
-        return render_template("unavailable.html.jinja")
+    submission = Submission.query.get(id)
 
-    if submission.email == session["email"]:
-        db.session.add(Viewed(submission_id=submission.id))
-        db.session.commit()
+    if submission is None:
+        waiting = db.get_or_404(Waiting, id)
+        if (waiting.email != session["email"]) and (session["email"] not in staff):
+            return render_template("unavailable.html.jinja")
 
-    return render_template(
-        "submission_view.html.jinja",
-        submission = submission
-    )
+        if waiting.started_at is None or (waiting.started_at + timedelta(minutes=1) < datetime.now(timezone.utc)):
+            Thread(target=resolve_waiting, args=(id, current_app.app_context(),), daemon=True).start()
+
+        return render_template(
+            "waiting_view.html.jinja",
+            waiting = waiting
+        )
+
+    else:
+        if (submission.email != session["email"]) and (session["email"] not in staff):
+            return render_template("unavailable.html.jinja")
+
+        if submission.email == session["email"]:
+            db.session.add(Viewed(submission_id=submission.id))
+            db.session.commit()
+
+        return render_template(
+            "submission_view.html.jinja",
+            submission = submission
+        )
+
+
 
 @app.route("/entry", methods=["POST"])
 def receive_entry():
     data = request.get_json()
-    print(f"data: {data}\n")
-    id = 0
     if validate(data):
         submission, id = transform(data)
         print(f"id: {id}")
@@ -295,6 +443,7 @@ def receive_entry():
         abort(401)
 
 
+
 # this will eventually validate that the sender of an entry is us,
 # presumably by using a shared key
 def validate(data):
@@ -303,7 +452,6 @@ def validate(data):
 
 
 def transform(data):
-    # BAD: DO NOT DO PURE RANDOM FOR ID GEN
     gen_id = uuid.uuid4()
 
     comment_json_list = data["comments"]["comments"]

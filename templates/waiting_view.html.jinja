@@ -1,0 +1,29 @@
+{% extends "main.html.jinja" %}
+
+{% block head %}
+<meta http-equiv="refresh" content="5">
+{% endblock %}
+
+{% block header %}
+
+<article>
+<header>
+    <h4>Automatic feedback for <strong>{{waiting.email}}</strong>.</h4>
+</header>
+<ul>
+    <li>This contains your submission code, so may only be shared with course staff, or, on a partner assignment, with your partner.</li>
+<li><strong>WARNING:</strong> This feedback is generated automatically using a Large Language Model.<br/>While we expect the comments to usually be helpful, there are always possibilities for mistakes: comments received here should not override your own judgment, and <strong>you will not get points back if you follow advice here that leads to mistakes</strong></li>
+</ul>
+</article>
+{% endblock %}
+
+{% block content %}
+<article>
+<header>
+    <h3>
+      <span aria-busy="true">FeedBot is generating your results. Please stand by for comments.</span>
+    </h3>
+</header>
+<progress />
+</article>
+{% endblock %}

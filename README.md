@@ -3,12 +3,14 @@ Before attempting to run feedbot-website, ensure that you do the following:
 
     Add .env to project directory:
 Create a file ".env" and add the following to it:
+
 "
 AUTHORIZE_URL= *authorization_link*
 TOKEN_URL= *token_link*
 CLIENT_SECRET= *secret_key*
 CLIENT_ID= *client_id*
 FEEDBOT_KEY= *something you choose*
+OPENAI_KEY=sk-... 
 "
 
 Note the FEEDBOT_KEY can be anything; whatever you choose just has to match what
